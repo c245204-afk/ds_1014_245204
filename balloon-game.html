@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>風船ゲーム</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: linear-gradient(#cfeaff, #f6fbff);
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    color: #3b4a5a;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+  }
+  .app {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 0;
+  }
+  .bar {
+    display: flex;
+    gap: 28px;
+    align-items: baseline;
+    font-size: 14px;
+  }
+  .bar b { font-size: 22px; margin-left: 4px; color: #e5262e; }
+  .bar button {
+    font: inherit;
+    border: 0;
+    background: #fff;
+    color: #3b4a5a;
+    padding: 6px 12px;
+    border-radius: 999px;
+    box-shadow: 0 2px 6px rgba(60, 90, 120, .18);
+    cursor: pointer;
+  }
+  canvas {
+    display: block;
+    width: min(96vw, calc((100vh - 130px) * 0.6));
+    width: min(96vw, calc((100dvh - 130px) * 0.6));
+    aspect-ratio: 3 / 5;
+    border-radius: 18px;
+    box-shadow: 0 8px 24px rgba(60, 90, 120, .2);
+    touch-action: none;
+  }
+  .legend {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #7d8c9b;
+  }
+  .legend i {
+    display: block;
+    border-radius: 50%;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="bar">
+    <div>スコア<b id="score">0</b></div>
+    <div>ベスト<b id="best">0</b></div>
+    <button id="restart">リスタート</button>
+  </div>
+  <canvas id="c"></canvas>
+  <div class="legend" id="legend"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+(() => {
+  const { Engine, Bodies, Composite, Events } = Matter;
+
+  // ---- 設定 ----
+  const W = 360, H = 600;
+  const LINE_Y = 120;      // ゲームオーバーライン
+  const SPAWN_Y = 58;      // 風船を落とす高さ
+  const RADII = [15, 21, 28, 36, 45, 55, 66, 78, 91, 105];
+  const COLORS = ['#e5262e', '#ff8a1f', '#ffd21f', '#8bd22b', '#1fb86a',
+                  '#17b8c9', '#3a7bf0', '#8a4fe0', '#ff5fa8', '#f7c948'];
+  const MAXL = RADII.length - 1;
+  const MAX_DROP_LEVEL = 3;
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const S = Math.max(2, Math.min(3, window.devicePixelRatio || 1));
+  canvas.width = W * S;
+  canvas.height = H * S;
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+
+  // ---- 色のヘルパー ----
+  function shade(hex, p) {
+    const n = parseInt(hex.slice(1), 16);
+    let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+    const t = p < 0 ? 0 : 255, q = Math.abs(p);
+    r = Math.round((t - r) * q + r);
+    g = Math.round((t - g) * q + g);
+    b = Math.round((t - b) * q + b);
+    return `rgb(${r},${g},${b})`;
+  }
+
+  // ---- 凡例 ----
+  const legend = document.getElementById('legend');
+  legend.appendChild(document.createTextNode('小'));
+  COLORS.forEach((c, i) => {
+    const el = document.createElement('i');
+    const d = 9 + i * 2.2;
+    el.style.width = el.style.height = d + 'px';
+    el.style.background = `radial-gradient(circle at 35% 35%, ${shade(c, .5)}, ${c} 60%, ${shade(c, -.25)})`;
+    legend.appendChild(el);
+  });
+  legend.appendChild(document.createTextNode('大'));
+
+  // ---- ベストスコア ----
+  let best = 0;
+  try { best = parseInt(localStorage.getItem('balloon-best') || '0', 10) || 0; } catch (e) {}
+  bestEl.textContent = best;
+
+  // ---- 物理世界 ----
+  const engine = Engine.create({ positionIterations: 10, velocityIterations: 8 });
+  engine.gravity.y = 1;
+  engine.gravity.scale = 0.0013;
+  const world = engine.world;
+
+  const wallOpt = { isStatic: true, friction: 0.1, label: 'wall' };
+  Composite.add(world, [
+    Bodies.rectangle(-30, H / 2, 60, H * 3, wallOpt),
+    Bodies.rectangle(W + 30, H / 2, 60, H * 3, wallOpt),
+    Bodies.rectangle(W / 2, H + 30, W + 160, 60, wallOpt),
+  ]);
+
+  function makeBalloon(x, y, level) {
+    const b = Bodies.circle(x, y, RADII[level], {
+      restitution: 0.15,
+      friction: 0.08,
+      frictionStatic: 0.4,
+      frictionAir: 0.008,
+      density: 0.0012,
+      label: 'balloon',
+    });
+    b.level = level;
+    b.born = performance.now();
+    b.overSince = null;
+    Composite.add(world, b);
+    return b;
+  }
+
+  // ---- ゲーム状態 ----
+  let score = 0;
+  let over = false, overTime = 0;
+  let held, next;
+  let nextDropAt = 0;
+  let aimX = W / 2;
+  let pressed = false;
+  let started = false;
+  const pendingMerges = [];
+  const effects = [];
+
+  const randLevel = () => Math.floor(Math.random() * (MAX_DROP_LEVEL + 1));
+
+  function setScore(v) {
+    score = v;
+    scoreEl.textContent = v;
+    if (v > best) {
+      best = v;
+      bestEl.textContent = v;
+      try { localStorage.setItem('balloon-best', String(best)); } catch (e) {}
+    }
+  }
+
+  function restart() {
+    for (const b of Composite.allBodies(world)) {
+      if (b.label === 'balloon') Composite.remove(world, b);
+    }
+    pendingMerges.length = 0;
+    effects.length = 0;
+    setScore(0);
+    over = false;
+    held = randLevel();
+    next = randLevel();
+    nextDropAt = performance.now() + 200;
+  }
+
+  const clampX = (x, level) => {
+    const r = RADII[level];
+    return Math.max(r + 2, Math.min(W - r - 2, x));
+  };
+
+  function drop() {
+    const now = performance.now();
+    if (over || now < nextDropAt) return;
+    makeBalloon(clampX(aimX, held), SPAWN_Y, held);
+    held = next;
+    next = randLevel();
+    nextDropAt = now + 550;
+    started = true;
+  }
+
+  // ---- 合体 ----
+  Events.on(engine, 'collisionStart', ev => {
+    for (const pair of ev.pairs) {
+      const a = pair.bodyA, b = pair.bodyB;
+      if (a.label !== 'balloon' || b.label !== 'balloon') continue;
+      if (a.level !== b.level || a.dead || b.dead) continue;
+      a.dead = b.dead = true;
+      pendingMerges.push([a, b]);
+    }
+  });
+
+  function processMerges() {
+    while (pendingMerges.length) {
+      const [a, b] = pendingMerges.pop();
+      const x = (a.position.x + b.position.x) / 2;
+      const y = (a.position.y + b.position.y) / 2;
+      const lv = a.level;
+      Composite.remove(world, a);
+      Composite.remove(world, b);
+      effects.push({ x, y, r: RADII[lv], t0: performance.now(), color: COLORS[lv] });
+      if (lv === MAXL) {
+        setScore(score + 200);
+      } else {
+        const nl = lv + 1;
+        const nx = clampX(x, nl);
+        makeBalloon(nx, Math.min(y, H - RADII[nl] - 2), nl);
+        setScore(score + (nl * (nl + 1)) / 2 + 1);
+      }
+    }
+  }
+
+  // ---- ゲームオーバー判定 ----
+  function checkOver(now) {
+    for (const b of Composite.allBodies(world)) {
+      if (b.label !== 'balloon') continue;
+      const above = b.position.y - RADII[b.level] < LINE_Y;
+      if (above && now - b.born > 1000 && b.speed < 1.5) {
+        if (b.overSince === null) b.overSince = now;
+        if (now - b.overSince > 2000) {
+          over = true;
+          overTime = now;
+          return;
+        }
+      } else {
+        b.overSince = null;
+      }
+    }
+  }
+
+  function anyDanger() {
+    for (const b of Composite.allBodies(world)) {
+      if (b.label === 'balloon' && b.overSince !== null) return true;
+    }
+    return false;
+  }
+
+  // ---- 入力 ----
+  function px(e) {
+    const rc = canvas.getBoundingClientRect();
+    return (e.clientX - rc.left) * (W / rc.width);
+  }
+  canvas.addEventListener('pointerdown', e => {
+    if (over) {
+      if (performance.now() - overTime > 600) restart();
+      return;
+    }
+    canvas.setPointerCapture(e.pointerId);
+    pressed = true;
+    aimX = px(e);
+  });
+  canvas.addEventListener('pointermove', e => { aimX = px(e); });
+  canvas.addEventListener('pointerup', () => {
+    if (pressed) drop();
+    pressed = false;
+  });
+  canvas.addEventListener('pointercancel', () => { pressed = false; });
+  document.getElementById('restart').addEventListener('click', restart);
+
+  // ---- 描画 ----
+  function drawBalloon(x, y, r, level, angle, alpha) {
+    const c = COLORS[level];
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+
+    // 結び目
+    ctx.fillStyle = shade(c, -0.3);
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.13, r * 0.97);
+    ctx.lineTo(r * 0.13, r * 0.97);
+    ctx.lineTo(r * 0.2, r * 1.13);
+    ctx.lineTo(-r * 0.2, r * 1.13);
+    ctx.closePath();
+    ctx.fill();
+
+    // 本体
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r * 1.05);
+    g.addColorStop(0, shade(c, 0.45));
+    g.addColorStop(0.55, c);
+    g.addColorStop(1, shade(c, -0.3));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 最大レベルは星マーク
+    if (level === MAXL) {
+      ctx.fillStyle = 'rgba(255,255,255,.85)';
+      ctx.beginPath();
+      for (let i = 0; i < 10; i++) {
+        const rr = i % 2 === 0 ? r * 0.38 : r * 0.16;
+        const a = -Math.PI / 2 + (i * Math.PI) / 5;
+        ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // つや
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.beginPath();
+    ctx.ellipse(-r * 0.4, -r * 0.4, r * 0.15, r * 0.26, -0.65, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function roundRectPath(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw(now) {
+    ctx.clearRect(0, 0, W, H);
+
+    // 背景
+    ctx.save();
+    roundRectPath(0, 0, W, H, 18);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,.72)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(180,215,245,.22)';
+    ctx.fillRect(0, 0, W, LINE_Y);
+
+    // ゲームオーバーライン
+    const danger = anyDanger();
+    const pulse = danger ? 0.5 + 0.5 * Math.sin(now / 90) : 0;
+    ctx.strokeStyle = danger ? `rgba(229,38,46,${0.5 + pulse * 0.5})` : 'rgba(229,38,46,.35)';
+    ctx.lineWidth = danger ? 3 : 2;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath();
+    ctx.moveTo(0, LINE_Y);
+    ctx.lineTo(W, LINE_Y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 置く位置のガイド
+    if (!over && now >= nextDropAt) {
+      const gx = clampX(aimX, held);
+      ctx.strokeStyle = 'rgba(80,110,140,.25)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 8]);
+      ctx.beginPath();
+      ctx.moveTo(gx, SPAWN_Y + RADII[held]);
+      ctx.lineTo(gx, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      drawBalloon(gx, SPAWN_Y, RADII[held], held, 0, 1);
+    }
+
+    // 風船
+    for (const b of Composite.allBodies(world)) {
+      if (b.label !== 'balloon') continue;
+      const age = now - b.born;
+      const sc = age < 150 ? 0.75 + 0.25 * (age / 150) : 1;
+      drawBalloon(b.position.x, b.position.y, RADII[b.level] * sc, b.level, b.angle, 1);
+    }
+
+    // 合体エフェクト
+    for (let i = effects.length - 1; i >= 0; i--) {
+      const f = effects[i];
+      const t = (now - f.t0) / 380;
+      if (t >= 1) { effects.splice(i, 1); continue; }
+      ctx.strokeStyle = f.color;
+      ctx.globalAlpha = 1 - t;
+      ctx.lineWidth = 4 * (1 - t) + 1;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, f.r * (1 + t * 0.7), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // NEXT
+    ctx.fillStyle = '#7d8c9b';
+    ctx.font = 'bold 11px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('NEXT', W - 38, 20);
+    drawBalloon(W - 38, 52, RADII[next] * 0.75, next, 0, 1);
+
+    // 操作説明
+    if (!started) {
+      ctx.fillStyle = '#7d8c9b';
+      ctx.font = '13px -apple-system, "Hiragino Sans", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('ドラッグで位置を決めて、離すと落下', 14, 22);
+      ctx.fillText('同じ色の風船がぶつかると合体!', 14, 40);
+    }
+
+    // ゲームオーバー
+    if (over) {
+      ctx.fillStyle = 'rgba(255,255,255,.8)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#e5262e';
+      ctx.font = 'bold 34px -apple-system, "Hiragino Sans", sans-serif';
+      ctx.fillText('ゲームオーバー', W / 2, H / 2 - 30);
+      ctx.fillStyle = '#3b4a5a';
+      ctx.font = 'bold 22px -apple-system, sans-serif';
+      ctx.fillText('スコア ' + score, W / 2, H / 2 + 8);
+      ctx.font = '14px -apple-system, "Hiragino Sans", sans-serif';
+      ctx.fillStyle = '#7d8c9b';
+      ctx.fillText('タップでもう一度', W / 2, H / 2 + 42);
+    }
+    ctx.restore();
+  }
+
+  // ---- メインループ ----
+  const STEP = 1000 / 60;
+  let lastT = performance.now(), acc = 0;
+  function loop(now) {
+    acc += Math.min(now - lastT, 50);
+    lastT = now;
+    while (acc >= STEP) {
+      if (!over) {
+        Engine.update(engine, STEP);
+        processMerges();
+        checkOver(now);
+      }
+      acc -= STEP;
+    }
+    draw(now);
+    requestAnimationFrame(loop);
+  }
+
+  restart();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
